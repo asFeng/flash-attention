@@ -233,9 +233,29 @@ bool composite_mask(int q_idx, int k_idx, int seq_len, int block_size) const {
 
 **Tile 级跳过分析**：复合 mask 的结构非常规整——整个上半部分（clean→noisy）是全 0，可以跳过 ~25% 的 tiles。
 
-#### Kernel 0c: `flash_attn_selective_kv` — 选择性 KV Refresh
+#### Kernel 0c: `flash_attn_selective_kv` — 选择性 KV Refresh (DualCache)
 
 所有推理框架的核心瓶颈：在 denoising 迭代中如何复用 frozen block 的 KV。
+
+**背景**：Fast-dLLM 的 DualCache 使用 `replace_position`（一个 `[batch, seq_len]` 的 0/1 mask）
+在已有 KV cache 中**原地覆盖**指定位置的 KV，而非 AR 模型的 append 模式。当前实现是
+Python for 循环 + 逐 batch scatter，本身就是重要的优化目标：
+
+```python
+# Fast-dLLM v1 的 replace_position 实现（llada/model/modeling_llada.py）:
+if replace_position is None:
+    k = torch.cat((past_key, k), dim=-2)           # 标准 AR: append
+else:
+    for batch_idx in range(B):                       # Python for 循环!
+        indices = replace_position[batch_idx].nonzero(as_tuple=True)[0]
+        past_key[batch_idx, :, indices] = k[batch_idx, :, :len(indices)]    # scatter
+        past_value[batch_idx, :, indices] = v[batch_idx, :, :len(indices)]
+    k, v = past_key, past_value
+```
+
+Fast-dLLM v2 使用两层缓存：
+- **Block-level cache（精确）**：block-causal attention 使已解码 block 的 KV 精确有效
+- **Sub-block cache / DualCache（近似）**：block 内 denoising 迭代时复用 prefix+suffix KV
 
 **接口设计**：
 
@@ -245,9 +265,9 @@ def flash_attn_selective_kv(
     kv_cache,                          # [batch, total_len, 2, kv_heads, dim]  — 全局 cache
     active_kv,                         # [batch, active_len, 2, kv_heads, dim] — 当前 block 新 KV
     cache_seqlens,                     # [batch] — cache 中有效 KV 的长度
-    block_start: int,                  # 当前 block 在序列中的起始位置
+    replace_position: Tensor,          # [batch, total_len] bool — DualCache 核心：指定覆盖位置
     block_size: int,                   # block 大小
-    replace_mode: str = "overwrite",   # "overwrite" | "append" | "vicinity_refresh"
+    block_causal: bool = True,         # v2=True (精确 block 间 cache), v1=False (近似)
     vicinity_window: int = 0,          # vicinity refresh 时刷新邻近多少个位置
 ) -> Tuple[Tensor, Tensor]:            # (attn_output, updated_kv_cache)
 ```
